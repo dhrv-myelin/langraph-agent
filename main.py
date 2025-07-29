@@ -1,40 +1,91 @@
-from typing import Annotated
+from typing import Annotated, Sequence
 
 from typing_extensions import TypedDict
-
+from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-import os
 from langchain_ollama import ChatOllama
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
-llm = ChatOllama(
+memory = InMemorySaver()
+
+#model selection with langchain_ollama
+model = ChatOllama(
     model="gemma3:1b")
 
-class State(TypedDict):
-    # Messages have the type "list". The `add_messages` function
-    # in the annotation defines how this state key should be updated
-    # (in this case, it appends messages to the list, rather than overwriting them)
-    messages: Annotated[list, add_messages]
+# for memory
+config = {"configurable": {"thread_id": "1"}}
 
 
-graph_builder = StateGraph(State)
 
 
-def chatbot(state: State):
-    return {"messages": [llm.invoke(state["messages"])]}
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
 
 
-# The first argument is the unique node name
-# The second argument is the function or object that will be called whenever
-# the node is used.
-graph_builder.add_node("chatbot", chatbot)
-graph_builder.add_edge(START, "chatbot")
-graph_builder.add_edge("chatbot", END)
-graph = graph_builder.compile()
+@tool
+def add(a: int, b:int):
+    """This is an addition function that adds 2 numbers together"""
 
+    return a + b 
+
+@tool
+def subtract(a: int, b: int):
+    """Subtraction function"""
+    return a - b
+
+@tool
+def multiply(a: int, b: int):
+    """Multiplication function"""
+    return a * b
+
+tools = [add, subtract, multiply]
+
+
+
+def model_call(state:AgentState) -> AgentState:
+    system_prompt = SystemMessage(content=
+        "You are my AI assistant, please answer my query to the best of your ability. Be brief"
+    )
+    response = model.invoke([system_prompt] + state["messages"])
+    return {"messages": [response]}
+
+
+def should_continue(state: AgentState): 
+    messages = state["messages"]
+    last_message = messages[-1]
+    if not last_message.tool_calls: 
+        return "end"
+    else:
+        return "continue"
+    
+
+graph = StateGraph(AgentState)
+graph.add_node("our_agent", model_call)
+
+
+tool_node = ToolNode(tools=tools)
+graph.add_node("tools", tool_node)
+
+graph.set_entry_point("our_agent")
+
+graph.add_conditional_edges(
+    "our_agent",
+    should_continue,
+    {
+        "continue": "tools",
+        "end": END,
+    },
+)
+
+graph.add_edge("tools", "our_agent")
+
+app = graph.compile(checkpointer=memory)
 
 def stream_graph_updates(user_input: str):
-    for event in graph.stream({"messages": [{"role": "user", "content": user_input}]}):
+    for event in app.stream({"messages": [{"role": "user", "content": user_input}]},config):
         for value in event.values():
             print("Assistant:", value["messages"][-1].content)
 
